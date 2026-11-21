@@ -184,7 +184,7 @@ class WorkerLoRAManager:
             )
             if self._cached_dummy_lora is None:
                 self._cached_dummy_lora = dummy_lora
-        return self._adapter_manager.add_adapter(dummy_lora)
+        return self._add_adapter_or_rollback(dummy_lora)
 
     def get_dummy_lora_warmup_rank(self, default_rank: int) -> int:
         return self._adapter_manager.get_dummy_lora_warmup_rank(default_rank)
@@ -222,14 +222,49 @@ class WorkerLoRAManager:
         for adapter_id in requested_ids - existing_adapters:
             self.add_adapter(models_map[adapter_id])
 
+    def _add_adapter_or_rollback(self, lora: LoRAModel) -> bool:
+        try:
+            return self._adapter_manager.add_adapter(lora)
+        except Exception:
+            # A failed add must not leave a partially registered adapter
+            # behind; otherwise the next load with the same id would skip
+            # loading and try to activate the poisoned entry.
+            try:
+                self._adapter_manager.remove_adapter(lora.id)
+            except Exception:
+                logger.exception(
+                    "Failed to roll back adapter %s after add failure", lora.id
+                )
+            raise
+
+    def _activate_adapter_or_rollback(self, adapter_id: int, *, added: bool) -> None:
+        try:
+            self._adapter_manager.activate_adapter(adapter_id)
+        except Exception:
+            if added:
+                # Activation can fail after the adapter was registered (for
+                # example, a shape mismatch in one module). Remove it so the
+                # next add for the same id reloads instead of reusing a
+                # poisoned entry. An already-registered adapter is kept: the
+                # failure may be transient, and the caller may still want the
+                # previously healthy weights.
+                try:
+                    self._adapter_manager.remove_adapter(adapter_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to roll back adapter %s after activation failure",
+                        adapter_id,
+                    )
+            raise
+
     def add_adapter(self, adapter_request: Any) -> bool:
         if adapter_request.adapter_id in self.list_adapters():
             return False
         # One-time per adapter
         with gpu_sync_allowed():
             loaded_adapter = self._load_adapter(adapter_request)
-            loaded = self._adapter_manager.add_adapter(loaded_adapter)
-            self._adapter_manager.activate_adapter(loaded_adapter.id)
+            loaded = self._add_adapter_or_rollback(loaded_adapter)
+            self._activate_adapter_or_rollback(loaded_adapter.id, added=True)
         return loaded
 
     def remove_adapter(self, adapter_id: int) -> bool:
@@ -293,10 +328,11 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
         # the single-threaded core engine loop.
 
         with gpu_sync_allowed():
-            if (
+            added = (
                 lora_request.lora_int_id not in self.list_adapters()
                 or lora_request.load_inplace
-            ):
+            )
+            if added:
                 # Load the new adapter first to ensure it is actually valid, before
                 # evicting any existing adapters.
                 # This may cause the # of loaded lora adapters to very temporarily
@@ -313,7 +349,7 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
                     assert isinstance(self._adapter_manager, LRUCacheLoRAModelManager)
                     self._adapter_manager.remove_oldest_adapter()
                 # Then add the new adapter to the cache
-                loaded = self._adapter_manager.add_adapter(lora)
+                loaded = self._add_adapter_or_rollback(lora)
             else:
                 # If the lora is already loaded, just touch it to
                 # update its position in the caches
@@ -321,5 +357,5 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
                     self._adapter_manager.get_adapter(lora_request.lora_int_id)
                     is not None
                 )
-            self._adapter_manager.activate_adapter(lora_request.lora_int_id)
+            self._activate_adapter_or_rollback(lora_request.lora_int_id, added=added)
         return loaded

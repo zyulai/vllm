@@ -8,6 +8,7 @@ import pytest
 
 from vllm import LLM
 from vllm.exceptions import ProfilerAlreadyActiveError
+from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.metrics.reader import Counter, Gauge, Histogram, Metric, Vector
@@ -128,6 +129,19 @@ def test_invalid_profile_controls_rejected_before_engine_core_dispatch(kwargs):
         engine.start_profile(**kwargs)
 
     engine.engine_core.profile.assert_not_called()
+
+
+@pytest.mark.parametrize("has_previous", [False, True])
+def test_add_lora_failure_restores_registration(has_previous: bool):
+    engine = object.__new__(LLMEngine)
+    engine.engine_core = MagicMock()
+    engine.engine_core.add_lora.side_effect = RuntimeError("activation failed")
+    engine._lora_adapters = {1: ("old", "/old")} if has_previous else {}
+    request = LoRARequest("new", 1, "/new", load_inplace=has_previous)
+
+    with pytest.raises(RuntimeError, match="activation failed"):
+        engine.add_lora(request)
+    assert engine._lora_adapters == ({1: ("old", "/old")} if has_previous else {})
 
 
 def _vllm_model(

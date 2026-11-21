@@ -482,8 +482,16 @@ class LLMEngine:
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
+        previous = self._lora_adapters.get(lora_request.lora_int_id)
         self._register_lora(lora_request)
-        return self.engine_core.add_lora(lora_request)
+        try:
+            return self.engine_core.add_lora(lora_request)
+        except Exception:
+            if previous is None:
+                self._lora_adapters.pop(lora_request.lora_int_id, None)
+            else:
+                self._lora_adapters[lora_request.lora_int_id] = previous
+            raise
 
     def remove_lora(self, lora_id: int) -> bool:
         """Remove an already loaded LoRA adapter."""

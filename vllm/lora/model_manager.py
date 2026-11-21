@@ -375,31 +375,50 @@ class LoRAModelManager:
             "Activating LoRA. int id: %d, slot index: %d", lora_model.id, index
         )
         num_lora_weights_applied = 0
-        for module_name, module in self.modules.items():
-            if isinstance(module, BaseClassificationHeadWithLoRA):
-                full_module = self._get_module_to_save_weights(lora_model, module_name)
-                if full_module is None:
-                    module.reset_module_to_save(index)
-                else:
-                    module.set_module_to_save(
-                        index, full_module.weight, full_module.bias
+        try:
+            for module_name, module in self.modules.items():
+                if isinstance(module, BaseClassificationHeadWithLoRA):
+                    full_module = self._get_module_to_save_weights(
+                        lora_model, module_name
                     )
+                    if full_module is None:
+                        module.reset_module_to_save(index)
+                    else:
+                        module.set_module_to_save(
+                            index, full_module.weight, full_module.bias
+                        )
 
-            module_lora = self._get_lora_layer_weights(lora_model, module_name)
-            if not module_lora:
-                module.reset_lora(index)
-                logger.debug(
-                    "No LoRA weights found for module %s, skipping.", module_name
+                module_lora = self._get_lora_layer_weights(lora_model, module_name)
+                if not module_lora:
+                    module.reset_lora(index)
+                    logger.debug(
+                        "No LoRA weights found for module %s, skipping.", module_name
+                    )
+                    continue
+
+                module.set_lora(
+                    index,
+                    module_lora.lora_a,
+                    module_lora.lora_b,
                 )
-                continue
-
-            module.set_lora(
-                index,
-                module_lora.lora_a,
-                module_lora.lora_b,
-            )
-            num_lora_weights_applied += 1
-            logger.debug("Successfully loaded LoRA weights for module %s.", module_name)
+                num_lora_weights_applied += 1
+                logger.debug(
+                    "Successfully loaded LoRA weights for module %s.", module_name
+                )
+        except Exception:
+            for module_name, module in self.modules.items():
+                try:
+                    if isinstance(module, BaseClassificationHeadWithLoRA):
+                        module.reset_module_to_save(index)
+                    module.reset_lora(index)
+                except Exception:
+                    logger.exception(
+                        "Failed to reset LoRA slot %d for module %s during "
+                        "activation rollback",
+                        index,
+                        module_name,
+                    )
+            raise
         if num_lora_weights_applied == 0:
             logger.debug_once(
                 "No LoRA weights were applied for adapter %s on this worker. "

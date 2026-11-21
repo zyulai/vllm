@@ -1022,6 +1022,95 @@ def test_lru_cache_worker_adapter_manager(dist_init, dummy_model, device, tmp_pa
     assert punica_wrapper.device == device
 
 
+def _activation_test_manager() -> LRUCacheLoRAModelManager:
+    manager = LRUCacheLoRAModelManager.__new__(LRUCacheLoRAModelManager)
+    manager.lora_config = LoRAConfig(max_cpu_loras=4, max_loras=2)
+    manager._registered_adapters = AdapterLRUCache(4, manager.deactivate_adapter)
+    manager._active_adapters = AdapterLRUCache(2, manager._deactivate_adapter)
+    manager.lora_index_to_id = [None, None]
+    manager._enable_mixed_moe_lora_format = False
+    manager.is_pooling_model = False
+    manager.packed_modules = {}
+    manager.modules = {
+        f"dense{index}": ReplicatedLinearWithLoRA.__new__(ReplicatedLinearWithLoRA)
+        for index in range(2)
+    }
+    for module in manager.modules.values():
+        module.n_slices = 1
+        module.tp_size = 1
+        module.lora_a_stacked = (torch.zeros(2, 1, 8, 4),)
+        module.lora_b_stacked = (torch.zeros(2, 1, 4, 8),)
+    return manager
+
+
+def _activation_test_lora(adapter_id: int, input_size: int = 4) -> LoRAModel:
+    return LoRAModel(
+        adapter_id,
+        8,
+        {
+            "dense0": LoRALayerWeights(
+                "dense0", 8, 16, torch.ones(8, 4), torch.ones(4, 8)
+            ),
+            "dense1": LoRALayerWeights(
+                "dense1", 8, 16, torch.ones(8, input_size), torch.ones(4, 8)
+            ),
+        },
+    )
+
+
+def test_activation_failure_clears_partially_written_slot():
+    manager = _activation_test_manager()
+    assert manager.add_adapter(_activation_test_lora(2, input_size=5))
+
+    with pytest.raises(RuntimeError, match="size of tensor"):
+        manager.activate_adapter(2)
+    assert manager.list_adapters() == {2: manager.get_adapter(2)}
+    assert manager.lora_index_to_id == [None, None]
+    for module in manager.modules.values():
+        assert not module.lora_a_stacked[0][0].any()
+        assert not module.lora_b_stacked[0][0].any()
+
+
+def test_lru_worker_add_adapter_rolls_back_after_activation_failure():
+    worker = LRUCacheWorkerLoRAManager.__new__(LRUCacheWorkerLoRAManager)
+    worker._adapter_manager = _activation_test_manager()
+    load_calls = []
+
+    def load_adapter(lora_request: LoRARequest) -> LoRAModel:
+        load_calls.append(lora_request.lora_int_id)
+        return _activation_test_lora(
+            lora_request.lora_int_id, input_size=5 if len(load_calls) == 1 else 4
+        )
+
+    worker._load_adapter = load_adapter  # type: ignore[method-assign]
+    request = LoRARequest("adapter", 2, "/tmp/not-used")
+
+    with pytest.raises(RuntimeError, match="size of tensor"):
+        worker.add_adapter(request)
+    assert worker.list_adapters() == set()
+
+    assert worker.add_adapter(request) is True
+    assert load_calls == [2, 2]
+    assert worker._adapter_manager.lora_index_to_id == [2, None]
+
+
+def test_lru_worker_activation_failure_keeps_preexisting_adapter():
+    worker = LRUCacheWorkerLoRAManager.__new__(LRUCacheWorkerLoRAManager)
+    worker._adapter_manager = _activation_test_manager()
+    request = LoRARequest("adapter", 2, "/tmp/not-used")
+    assert worker._adapter_manager.add_adapter(_activation_test_lora(2, input_size=5))
+
+    with pytest.raises(RuntimeError, match="size of tensor"):
+        worker.add_adapter(request)
+    assert worker.list_adapters() == {2}
+    assert worker._adapter_manager.lora_index_to_id == [None, None]
+
+    worker._adapter_manager.remove_adapter(2)
+    assert worker._adapter_manager.add_adapter(_activation_test_lora(2))
+    assert worker.add_adapter(request) is True
+    assert worker._adapter_manager.lora_index_to_id == [2, None]
+
+
 @pytest.mark.parametrize("device", DEVICES)
 def test_worker_adapter_manager(dist_init, dummy_model_gate_up, device, tmp_path):
     # Should remove every LoRA not specified in the request.
